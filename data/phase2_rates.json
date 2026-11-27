@@ -1,0 +1,27 @@
+{
+  "source_file": "dengue_onsite.csv",
+  "fit_years": [
+    2016,
+    2023
+  ],
+  "method": "least_squares_through_origin",
+  "rates": {
+    "saline": 2.384149,
+    "kits": 1.158187,
+    "beds": 0.295523
+  },
+  "verification_2025": {
+    "saline": {
+      "exact": 3120,
+      "total": 3120
+    },
+    "kits": {
+      "exact": 3119,
+      "total": 3120
+    },
+    "beds": {
+      "exact": 3120,
+      "total": 3120
+    }
+  }
+}
