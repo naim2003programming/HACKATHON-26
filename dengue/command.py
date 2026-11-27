@@ -16,7 +16,6 @@ from dengue.fallback import (
     safe_ceil,
 )
 from dengue.phase2_config import (
-    BED_OVERFLOW_THRESHOLD,
     BED_SURGE_THRESHOLD,
     CITY_COLS,
     DEFAULT_BUFFER_PCT,
@@ -39,7 +38,7 @@ from dengue.phase2_config import (
 # Flip each flag to True as its real backend module is verified and tested.
 USE_REAL: Dict[str, bool] = {
     "resources": True,
-    "routing": False,
+    "routing": True,
     "simulator": False,
 }
 
@@ -199,8 +198,8 @@ def _summarize_cities_and_alerts(
                 "city": crow["city"],
                 "ward_id": None,
                 "message": (
-                    f"City pool exhausted in {crow['city']}: "
-                    f"{int(crow['beds_unmet'])} unmet bed(s) — escalate to Civil Surgeon."
+                    f"city pool exhausted - escalate ({crow['city']}): "
+                    f"{int(crow['beds_unmet'])} unmet bed(s)."
                 ),
             }
         )
@@ -262,14 +261,16 @@ def _run_honest_dummy(
         100.0,
     )
 
-    util_ratio = np.where(df["bed_capacity"] > 0, df["beds_required"] / df["bed_capacity"], 0.0)
+    req_b = df["beds_required"].astype(int).to_numpy()
+    cap_b = df["bed_capacity"].astype(int).to_numpy()
+    util_ratio = np.where(cap_b > 0, req_b / np.maximum(cap_b, 1), 0.0)
     df["bed_utilization_pct"] = (100.0 * util_ratio).round(1)
     df["bed_status"] = np.select(
-        [util_ratio > BED_OVERFLOW_THRESHOLD, util_ratio >= BED_SURGE_THRESHOLD],
+        [req_b > cap_b, util_ratio >= BED_SURGE_THRESHOLD - 1e-9],
         ["Overflow", "Surge Warning"],
         default="Normal",
     )
-    df["bed_overflow"] = np.maximum(0, df["beds_required"] - df["bed_capacity"]).astype(int)
+    df["bed_overflow"] = np.maximum(0, req_b - cap_b).astype(int)
     df["bed_net_deficit"] = df["bed_overflow"].astype(int)
 
     df["density_crew_score"] = (df["pred"] * df["priority_weight"]).round(4)
