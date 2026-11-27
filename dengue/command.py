@@ -38,7 +38,7 @@ from dengue.phase2_config import (
 
 # Flip each flag to True as its real backend module is verified and tested.
 USE_REAL: Dict[str, bool] = {
-    "resources": False,
+    "resources": True,
     "routing": False,
     "simulator": False,
 }
@@ -106,7 +106,6 @@ def _attach_ward_traits(
     df = fc.copy()
     issue_ts = pd.Timestamp(issue_date)
 
-    # Attach density and current cases if present in raw dataset
     if not raw_df.empty:
         latest_traits = (
             raw_df.sort_values("date")
@@ -128,7 +127,6 @@ def _attach_ward_traits(
     if "cases_now" not in df.columns:
         df["cases_now"] = np.nan
 
-    # Bed capacity: edited value * multiplier, min 2
     cap_edits = params.capacity_overrides or {}
     mult = max(0.25, float(params.capacity_multiplier))
     base_caps = [
@@ -140,123 +138,30 @@ def _attach_ward_traits(
     return df
 
 
-def _run_honest_dummy(
-    base_df: pd.DataFrame,
-    params: CommandParams,
-    rates: Dict[str, float],
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
-    """Honest deterministic baseline using parquet forecasts (for H1 parallel UI work)."""
-    df = base_df.copy()
-    h = int(params.horizon)
-    df["pred"] = df[f"pred_h{h}"].astype("float64")
-    df["high_pred"] = df[f"high_h{h}"].astype("float64")
-
-    if "tier" not in df.columns:
-        df["tier"] = _assign_tier(df["pred"])
-    df["tier"] = df["tier"].map(_normalize_tier_label)
-
-    # High/Critical/Watch use P90 upper range (high_pred); Low uses pred
-    use_upper = df["tier"].isin(["Watch", "High", "Critical"])
-    df["demand_basis"] = np.where(use_upper, df["high_pred"], df["pred"]).astype("float64")
-
-    # Priority weight: tier weight * (1 + density / city_max_density)
-    city_max_density = df.groupby("city")["population_density_sqkm"].transform("max").clip(lower=1.0)
-    tier_w = df["tier"].map(lambda t: TIER_WEIGHTS.get(t, 1.0)).astype("float64")
-    df["priority_weight"] = (tier_w * (1.0 + df["population_density_sqkm"] / city_max_density)).round(4)
-
-    buf_factor = 1.0 + max(0.0, float(params.buffer_pct)) / 100.0
-    base_saline = safe_ceil(rates["saline"] * df["demand_basis"])
-    base_kits = safe_ceil(rates["kits"] * df["demand_basis"])
-    base_beds = safe_ceil(rates["beds"] * df["demand_basis"])
-
-    df["saline_required"] = safe_ceil(base_saline * buf_factor)
-    df["kits_required"] = safe_ceil(base_kits * buf_factor)
-    df["beds_required"] = safe_ceil(base_beds * buf_factor)
-
-    overrides = params.overrides or {}
-    saline_pct = float(overrides.get("saline", params.stock_pct)) / 100.0
-    kits_pct = float(overrides.get("kits", params.stock_pct)) / 100.0
-
-    # Honest dummy allocation: proportional floor capped at required
-    df["saline_allocated"] = np.minimum(
-        df["saline_required"], np.floor(base_saline * saline_pct).astype(int)
-    )
-    df["saline_deficit"] = (df["saline_required"] - df["saline_allocated"]).clip(lower=0)
-    df["saline_fill_pct"] = np.where(
-        df["saline_required"] > 0,
-        (100.0 * df["saline_allocated"] / df["saline_required"]).round(1),
-        100.0,
-    )
-
-    df["kits_allocated"] = np.minimum(
-        df["kits_required"], np.floor(base_kits * kits_pct).astype(int)
-    )
-    df["kits_deficit"] = (df["kits_required"] - df["kits_allocated"]).clip(lower=0)
-    df["kits_fill_pct"] = np.where(
-        df["kits_required"] > 0,
-        (100.0 * df["kits_allocated"] / df["kits_required"]).round(1),
-        100.0,
-    )
-
-    # Bed status bands (Bagust et al., BMJ 1999)
-    util_ratio = np.where(df["bed_capacity"] > 0, df["beds_required"] / df["bed_capacity"], 0.0)
-    df["bed_utilization_pct"] = (100.0 * util_ratio).round(1)
-    df["bed_status"] = np.select(
-        [util_ratio > BED_OVERFLOW_THRESHOLD, util_ratio >= BED_SURGE_THRESHOLD],
-        ["Overflow", "Surge Warning"],
-        default="Normal",
-    )
-    df["bed_overflow"] = np.maximum(0, df["beds_required"] - df["bed_capacity"]).astype(int)
-    df["bed_net_deficit"] = df["bed_overflow"].astype(int)
-
-    # Top-N crew stub
-    df["density_crew_score"] = (df["pred"] * df["priority_weight"]).round(4)
-    df["crews_needed"] = np.where(df["tier"].isin(["High", "Critical"]), 2, np.where(df["pred"] >= 5.0, 1, 0)).astype(int)
-    df["crews_assigned"] = 0
-    total_crews = max(0, int(params.total_crews))
-    if total_crews > 0 and len(df) > 0:
-        ranked_idx = df.sort_values(
-            ["density_crew_score", "ward_id"], ascending=[False, True], kind="mergesort"
-        ).index.tolist()
-        for i in range(total_crews):
-            df.loc[ranked_idx[i % len(ranked_idx)], "crews_assigned"] += 1
-    df["crews_deficit"] = np.maximum(0, df["crews_needed"] - df["crews_assigned"]).astype(int)
-
-    # Simulator placeholders (0 until simulator wired)
-    df["cases_prevented"] = 0.0
-    df["beds_prevented"] = 0.0
-    df["saline_prevented"] = 0.0
-    df["roi_per_crew"] = 0.0
-
-    # Flags
-    df["deficit_flag"] = (
-        (df["saline_deficit"] > 0)
-        | (df["kits_deficit"] > 0)
-        | (df["bed_net_deficit"] > 0)
-        | (df["crews_deficit"] > 0)
-    )
-    df["red_alert"] = df["tier"].isin(["High", "Critical"]) & (
-        (df["saline_deficit"] > 0) | (df["kits_deficit"] > 0) | (df["bed_net_deficit"] > 0)
-    )
-    df["code_black"] = (df["bed_net_deficit"] > 0) & (df["saline_deficit"] > 0)
-
-    transfers = pd.DataFrame(columns=list(TRANSFER_COLS))
-
-    # City-level rollup
+def _summarize_cities_and_alerts(
+    df: pd.DataFrame,
+    transfers: pd.DataFrame,
+) -> tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Rebuild city-level rollups and escalation alerts from the ward DataFrame."""
     city_rows = []
     for city_name, grp in df.groupby("city", sort=True):
         beds_req = int(grp["beds_required"].sum())
         bed_cap = int(grp["bed_capacity"].sum())
         beds_unmet = int(grp["bed_net_deficit"].sum())
+        beds_routed = (
+            int(transfers.loc[transfers["city"] == city_name, "patients_moved"].sum())
+            if not transfers.empty
+            else 0
+        )
         headroom = max(0, bed_cap - beds_req)
-        exhausted = beds_req > bed_cap
+        exhausted = beds_unmet > 0 or beds_req > bed_cap
         city_rows.append(
             {
                 "city": str(city_name),
                 "total_wards": int(len(grp)),
                 "beds_required": beds_req,
                 "bed_capacity": bed_cap,
-                "beds_routed": 0,
+                "beds_routed": beds_routed,
                 "beds_unmet": beds_unmet,
                 "utilization_pct": round(100.0 * beds_req / bed_cap, 1) if bed_cap > 0 else 0.0,
                 "remaining_headroom": headroom,
@@ -299,8 +204,107 @@ def _run_honest_dummy(
                 ),
             }
         )
+    return cities, alerts
 
+
+def _run_honest_dummy(
+    base_df: pd.DataFrame,
+    params: CommandParams,
+    rates: Dict[str, float],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    """Honest deterministic baseline using parquet forecasts."""
+    df = base_df.copy()
+    h = int(params.horizon)
+    df["pred"] = df[f"pred_h{h}"].astype("float64")
+    df["high_pred"] = df[f"high_h{h}"].astype("float64")
+
+    if "tier" not in df.columns:
+        df["tier"] = _assign_tier(df["pred"])
+    df["tier"] = df["tier"].map(_normalize_tier_label)
+
+    use_upper = df["tier"].isin(["Watch", "High", "Critical"])
+    df["demand_basis"] = np.where(use_upper, df["high_pred"], df["pred"]).astype("float64")
+
+    city_max_density = df.groupby("city")["population_density_sqkm"].transform("max").clip(lower=1.0)
+    tier_w = df["tier"].map(lambda t: TIER_WEIGHTS.get(t, 1.0)).astype("float64")
+    df["priority_weight"] = (tier_w * (1.0 + df["population_density_sqkm"] / city_max_density)).round(4)
+
+    buf_factor = 1.0 + max(0.0, float(params.buffer_pct)) / 100.0
+    base_saline = safe_ceil(rates["saline"] * df["demand_basis"])
+    base_kits = safe_ceil(rates["kits"] * df["demand_basis"])
+    base_beds = safe_ceil(rates["beds"] * df["demand_basis"])
+
+    df["saline_required"] = safe_ceil(base_saline * buf_factor)
+    df["kits_required"] = safe_ceil(base_kits * buf_factor)
+    df["beds_required"] = safe_ceil(base_beds * buf_factor)
+
+    overrides = params.overrides or {}
+    saline_pct = float(overrides.get("saline", params.stock_pct)) / 100.0
+    kits_pct = float(overrides.get("kits", params.stock_pct)) / 100.0
+
+    df["saline_allocated"] = np.minimum(
+        df["saline_required"], np.floor(base_saline * saline_pct).astype(int)
+    )
+    df["saline_deficit"] = (df["saline_required"] - df["saline_allocated"]).clip(lower=0)
+    df["saline_fill_pct"] = np.where(
+        df["saline_required"] > 0,
+        (100.0 * df["saline_allocated"] / df["saline_required"]).round(1),
+        100.0,
+    )
+
+    df["kits_allocated"] = np.minimum(
+        df["kits_required"], np.floor(base_kits * kits_pct).astype(int)
+    )
+    df["kits_deficit"] = (df["kits_required"] - df["kits_allocated"]).clip(lower=0)
+    df["kits_fill_pct"] = np.where(
+        df["kits_required"] > 0,
+        (100.0 * df["kits_allocated"] / df["kits_required"]).round(1),
+        100.0,
+    )
+
+    util_ratio = np.where(df["bed_capacity"] > 0, df["beds_required"] / df["bed_capacity"], 0.0)
+    df["bed_utilization_pct"] = (100.0 * util_ratio).round(1)
+    df["bed_status"] = np.select(
+        [util_ratio > BED_OVERFLOW_THRESHOLD, util_ratio >= BED_SURGE_THRESHOLD],
+        ["Overflow", "Surge Warning"],
+        default="Normal",
+    )
+    df["bed_overflow"] = np.maximum(0, df["beds_required"] - df["bed_capacity"]).astype(int)
+    df["bed_net_deficit"] = df["bed_overflow"].astype(int)
+
+    df["density_crew_score"] = (df["pred"] * df["priority_weight"]).round(4)
+    df["crews_needed"] = np.where(
+        df["tier"].isin(["High", "Critical"]), 2, np.where(df["pred"] >= 5.0, 1, 0)
+    ).astype(int)
+    df["crews_assigned"] = 0
+    total_crews = max(0, int(params.total_crews))
+    if total_crews > 0 and len(df) > 0:
+        ranked_idx = df.sort_values(
+            ["density_crew_score", "ward_id"], ascending=[False, True], kind="mergesort"
+        ).index.tolist()
+        for i in range(total_crews):
+            df.loc[ranked_idx[i % len(ranked_idx)], "crews_assigned"] += 1
+    df["crews_deficit"] = np.maximum(0, df["crews_needed"] - df["crews_assigned"]).astype(int)
+
+    df["cases_prevented"] = 0.0
+    df["beds_prevented"] = 0.0
+    df["saline_prevented"] = 0.0
+    df["roi_per_crew"] = 0.0
+
+    df["deficit_flag"] = (
+        (df["saline_deficit"] > 0)
+        | (df["kits_deficit"] > 0)
+        | (df["bed_net_deficit"] > 0)
+        | (df["crews_deficit"] > 0)
+    )
+    df["red_alert"] = df["tier"].isin(["High", "Critical"]) & (
+        (df["saline_deficit"] > 0) | (df["kits_deficit"] > 0) | (df["bed_net_deficit"] > 0)
+    )
+    df["code_black"] = (df["bed_net_deficit"] > 0) & (df["saline_deficit"] > 0)
+
+    transfers = pd.DataFrame(columns=list(TRANSFER_COLS))
     df = df.sort_values("ward_id", kind="mergesort").reset_index(drop=True)
+    cities, alerts = _summarize_cities_and_alerts(df, transfers)
     return df, transfers, cities, alerts
 
 
@@ -336,10 +340,8 @@ def run_command_center(
     if params.city and params.city != "All":
         base_df = base_df.loc[base_df["city"] == params.city].copy().reset_index(drop=True)
 
-    # Start from honest dummy so every contract column always exists
     wards, transfers, cities, alerts = _run_honest_dummy(base_df, params, rates)
 
-    # Wire real modules progressively as each becomes ready
     sim_output = None
     if flags["simulator"]:
         try:
@@ -360,6 +362,7 @@ def run_command_center(
                 rates=rates,
                 sim_output=sim_output,
             )
+            cities, alerts = _summarize_cities_and_alerts(wards, transfers)
         except ImportError:
             pass
 
@@ -374,7 +377,6 @@ def run_command_center(
         except ImportError:
             pass
 
-    # Guarantee contract column presence and deterministic ward ordering
     for col in WARD_COLS:
         if col not in wards.columns:
             raise KeyError(f"Contract violation: missing ward column '{col}'")
